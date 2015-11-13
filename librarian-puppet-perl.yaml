@@ -1,0 +1,9 @@
+---
+AUTOCLEAN: 1
+DEBUG: 0
+LOGFILE: /var/log/puppet/puppet-librarian-perl.log
+MODULEDIR: ./kaka
+REPOLIST: Puppetfile.yaml
+RSYNC: rsync -a --delete --exclude .git
+TEST: 0
+TMPDIR: /etc/puppet/environments/.puppet-librarian-perl

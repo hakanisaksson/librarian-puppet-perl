@@ -1,0 +1,485 @@
+#!/usr/bin/env perl
+#
+
+=pod
+
+=head1 NAME
+
+B<librarian-puppet-perl> - Fetch and update puppet modules from git to Directory Environments configuration.
+
+=head1 SYNOPSIS
+
+librarian-puppet-perl <options> action
+
+B<actions:>
+
+  clean = remove cache and modules
+  convert = convert librarian-puppet file to YAML
+  fetch = fetch git repos but don't update modules
+  list = list modules and versions
+  update = update/install modules
+
+=head1 OPTIONS
+
+=over 10
+
+=item B<--debug>
+
+print debugging info
+
+=item B<--environment>
+
+limit environment, by default this script acts on all environments found
+
+=item B<--help>
+
+print the help text
+
+=item B<--man>
+
+print the complete documentation
+
+=item B<--test>
+
+run in test mode only
+
+=item B<--verbose>
+
+print mode information
+
+=back
+
+=head1 DESCRIPTION
+
+B<librarian-puppet-perl> Update puppet modules from selected Git repositories.
+Repositories need to be listed in a YAML-format textfile called Puppetfile.yaml
+librarian-puppet-perl is a replacement for librarian-puppet that is simpler and more robust. It does not pend on specific ruby version, it's made in Perl. Expects that you tag your versions properly in Git, but works even if you don't. Does not depend on the module containing a Puppetfile or metadata.json to display version information about the module. It does not automatically download module dependencies.
+Uses YAML format for configuration files instead of ruby format that breaks if you forget a comma.
+Maintains a local cache and uses rsync to update the actual configuration to minimize the time when the filesystem is changed.
+Expects puppet to be configured with Directory Environments, but would work with a single environment too.
+Any sub-directory with a Puppetfile.yaml is considered to be a Puppet Environment.
+This script is inspired by puppet-librarian by rodjek, but a total rewrite that uses rsync to ensure changes to modules have minimal impact on a running environment. It also don't have a crap ton of gem dependencies.
+
+Puppetfile.yaml format example:
+
+  FORGE: 'ssh://git.repo.com/git/puppet/modules'
+  MODULES:
+  - mod: base
+    git: git://git.repo.com/git/puppet/modules/base.git
+    ref: development
+  - mod: ldap
+    ref: 1.0.0
+  - mod: ntp
+
+B<Installation>
+    Ensure that perl-YAML is installed
+    Create Puppetfile.yaml
+    Run librarian-puppet-perl update
+
+B<Configuration>
+   librarian-puppet-perl creates a file librarian-puppet-perl.yaml in the directory where it is runnig if it does not exist. Edit the file to change defaults. Defaults can be overridden on the commandline.
+
+B<Example librarian-puppet-perl.yaml>:
+   ---
+   AUTOCLEAN: 1
+   DEBUG: 0
+   LOGDIR: /var/log/puppet
+   MODULEDIR: /etc/puppet/environments
+   REPOLIST: Puppetfile.yaml
+   RSYNC: rsync -a --delete --exclude .git
+   TEST: 0
+   TMPDIR: /etc/puppet/environments/.librarian-puppet-perl
+
+=cut
+
+use warnings;
+use strict;
+use FindBin;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+use YAML;
+use Data::Dumper;
+use POSIX; # strftime
+
+my %CFG = (
+    'AUTOCLEAN' => 1,   ### Auto clean removed mods
+    'DEBUG' => 0,       ### Debugmode
+    'TEST' => 0,        ### Testmode
+    'VERBOSE' => 0,     ### Show more information
+    'REPOLIST' => 'Puppetfile.yaml',  ### Name of repository list file
+    'MODULEDIR' => '/etc/puppet/environments', ### Puppet environments directory
+    'PREFIXDIR' => 'modules',         ### subdir for modules
+    'LOGFILE' => '/var/log/puppet/librarian-puppet-perl.log',    ### Logfile
+    'TMPDIR' => "/etc/puppet/environments/.librarian-puppet-perl", ### Where git clones are stored
+    'RSYNC' => 'rsync -a --delete --exclude .git',  ### rsync command
+    'QUIET' => 0,
+    );
+
+my $YAMLFILE = $FindBin::Bin."/".basename($FindBin::Script,"").".yaml";
+my %G;
+my @shellmsg;
+my $LOG_OPEN=0;
+
+sub msg {
+    my $msg = shift;
+    print "$msg\n" if ! $CFG{QUIET};
+}
+
+sub debug {
+    my $msg = shift;
+    print "DEBUG: $msg\n" if $CFG{DEBUG};
+}
+
+sub error {
+    my $msg = shift;
+    print "ERROR: $msg\n";
+    exit 1;
+}
+
+sub logmsg {
+    my $msg = shift;
+    if ( (! $LOG_OPEN) and (defined $CFG{LOGFILE}) ) {
+        debug("logmsg: open $CFG{LOGFILE}");
+        open(LOG_FH,">>$CFG{LOGFILE}") or error("Can't open $CFG{LOGFILE}: $!");
+        $LOG_OPEN=1;
+    }
+    my $dt=strftime("%Y-%m-%d %H:%M:%S", localtime(time()));
+    print LOG_FH "$dt $msg\n" if $LOG_OPEN;
+}
+
+#
+# Execute shell command
+# and return exitcode, output is saved in global @shellmsg
+#
+sub shell {
+    my ($cmd ) = @_;
+    my @out;
+    debug("shell($cmd) skipped"),return 0 if $CFG{TEST};
+    debug("shell($cmd)");
+    open(OUT,"$cmd 2>&1 |") or error("can't execute $cmd");
+    while (<OUT>) {
+        chomp;
+        push @out,$_;
+    }
+    close(OUT);
+    foreach my $line (@out) { debug("shell: $line"); };
+    @shellmsg=@out;
+    return $?;
+}
+
+
+#
+# Load or create config file if it does not exists, with YAML
+#
+sub load_config {
+    #return 0 if ! $HAVEYAML;
+    if ( -f "$YAMLFILE") {
+        my $data = YAML::LoadFile( $YAMLFILE );
+        foreach my $key (keys %{$data}) {
+            $CFG{$key} = $data->{$key};
+        }
+        debug("loaded $YAMLFILE");
+    } else {
+        my $data = \%CFG;
+        YAML::DumpFile( $YAMLFILE, $data );
+        debug("created $YAMLFILE");
+    }
+    return 1;
+}
+
+#
+# Get last tagged version from git clone, optionally from $ref
+#
+sub get_version {
+    my $gitrepo = shift;
+    my $ref = shift;
+    my $ver = "missing_version_tag";
+
+    #get latest tag
+    my $cmd="cd $gitrepo && git describe --tags --abbrev=0 2>/dev/null";
+    $cmd.=" $ref" if defined $ref;
+    debug($cmd);
+    my $lasttag=`$cmd`; chomp($lasttag);
+    $ver=$lasttag if defined $lasttag and $lasttag ne "";
+
+    return $ver;
+}
+
+#
+# Update all local git branches
+# does NOT preserve current branch/ref
+# assumes the repo is read only (i.e. fast-forward always works)
+sub update_branches {
+    my $gitrepo = shift;
+    #my $current = `git rev-parse --abbrev-ref HEAD`; chomp($current);
+    my $cmd="cd $gitrepo && git branch|sed 's/^.//'|grep -v \"\(no branch\)\"| awk '{print \$1}'";
+    my @out = `$cmd`;
+    foreach my $branch (@out) {
+        chomp($branch);
+        $cmd="cd $gitrepo && git checkout $branch";
+        shell($cmd);
+        $cmd="cd $gitrepo && git pull";
+        shell($cmd);
+    }
+}
+
+#
+# Delete a $mod from $modpath
+#
+sub delete_mod {
+    my $mod =shift;
+    my $modpath= shift;
+    my $fullpath = "$modpath/$mod";
+    error("delete_mod: missing mod") if ! defined $mod;
+    error("delete_mod: empty mod") if $mod eq "";
+    error("$modpath is not a directory") if ! -d $modpath;
+    error("$fullpath is not a directory") if ! -d $fullpath;
+
+    my $cmd="cd $modpath && rm -rf \"$mod\"";
+    if ( shell($cmd) ne 0 ) {
+        error("Failed to remove $fullpath");
+        return 1;
+    }
+    return 0;
+}
+
+#
+# Convert librarian-puppet Puppetfile to Puppetfile.yaml format
+# prints to stdout
+#
+sub convert_puppetfile {
+    my $file = shift;
+    my @rows;
+    my $mod="";
+    my $forge="";
+
+    debug("convert_puppetfile: $file");
+    error("missing file to convert. Use $0 convert <file>") if ! defined $file;
+    error("File $file does not exist.") if ! -e $file;
+    open(FH,"<$file") or error("Can't open $file: $?");
+    while (<FH>) {
+        chomp;
+        debug("convert: $_");
+        next if /^\#/;
+        if ( /^forge \"(.*)\"/ ) {
+            $forge=$1;
+        }
+        if ( /^mod '(.*)'/) {
+            $mod=$1; 
+            my @msplit = split(/\//,$mod);
+            $mod=$msplit[1] if defined $msplit[1];
+            debug("found mod $mod");
+            push(@rows,"  - mod: ".$mod);
+        } 
+        elsif (/\s+:git => '(.*)'/) {
+            push(@rows,"    git: ".$1);
+        }
+        elsif (/\s+:ref => '(.*)'/) {
+            push(@rows,"    ref: ".$1);
+        } else {
+            $mod="";
+        }
+        
+    }
+    msg "---";
+    msg "FORGE:" if $forge eq "";
+    msg "FORGE: '$forge'" if $forge ne "";
+    msg "MODULES:";
+    foreach my $row (@rows) {
+        msg $row;
+    }
+    exit(0);
+}
+#
+# Parse puppet env
+# 
+sub parse_env {
+    my $repofile = shift;
+    debug("parse_env: loading $repofile");
+    my $data = YAML::LoadFile( $repofile );
+    my @path = split(/\//,File::Spec->rel2abs($repofile));
+    my $env = $path[-2];
+    error("environment undefined. This script requires Puppet Directory Environments.") if ! defined $env;
+    my $moddir = $CFG{MODULEDIR}."/".$env;
+    $moddir.="/".$CFG{PREFIXDIR};
+    my $cache = $CFG{TMPDIR}."/".$env;
+    debug("parse_env: cache = $cache");
+    debug "parse_env: \$data = ".Dumper(\$data);
+    my $cmd;
+
+    ### for every module in $repofile...
+    foreach my $key (@{$data->{MODULES}}) {
+        my $mod;
+        $mod = $1 if $key->{mod} =~ /(^\w+$)/;
+        error("Invalid character in modulename $key->{mod}") if $mod ne $key->{mod};
+        debug("parse_env: mod $mod");
+        my $envmod="$env/$mod";
+        my $forge=$data->{FORGE}; $forge =~ s/\\$//;
+        $key->{git} = $data->{FORGE}."/".$mod.".git" if ! defined $key->{git};
+        debug("parse_env: git = $key->{git}");
+        my $cachemod=$cache."/".$mod;
+        my $v="latest";
+        my $r=$v;
+        my $oldv;
+
+        if (defined $G{ENVIRONMENT} and defined $env) {
+            next if ($G{ENVIRONMENT} ne $env);
+        }
+        if ( lc($G{'ACTION'}) eq "list" ) {
+            if ( ! -d $cachemod) {
+                msg "WARNING: missing clone of $envmod, use update to get it.";
+            } else {
+                $v=get_version($cachemod)  if ( -d $cachemod );
+                $r=$v;
+                if ($CFG{VERBOSE}) {
+                    $r = get_version($cachemod,"remotes/origin/master"); # if ! defined $key->{ref};
+                    msg "$moddir/$mod $v ($r)";
+                } else {
+                msg "$envmod $v";
+                }
+            }
+        }
+
+        if ( (lc($G{'ACTION'}) eq "update") or ( lc($G{'ACTION'}) eq "fetch") ) {
+            shell("mkdir -p $moddir") if ! -d $moddir;
+            shell("mkdir -p $cache") if  ! -d $cache;
+
+            if ( ! -d $cachemod) {
+                ### New clone
+                $cmd="cd $cache && git clone $key->{git} $mod";
+                if (shell($cmd) ne 0) {
+                    msg("WARNING: Failed to update module $mod from $key->{git}");
+                } else {
+                    if ( defined  $key->{ref} ) {
+                        $cmd="cd $cachemod && git checkout $key->{ref}";
+                        shell($cmd);
+                    }
+                    $v = get_version($cachemod); $oldv=$v;
+                    msg("Fetched new module $envmod ($v)") if (lc($G{'ACTION'}) eq "fetch");
+                }
+                if ( defined  $key->{ref} ) {
+                    $cmd="cd $cachemod && git checkout $key->{ref}";
+                    shell($cmd);
+                }
+            } else {
+                ### Mod is already cloned
+                $oldv = get_version($cachemod);
+                #$cmd="cd $cachemod && git checkout master";
+                #shell($cmd);
+                #$cmd="cd $cachemod && git pull";
+                #shell($cmd);
+                update_branches($cachemod);
+
+                if ( defined  $key->{ref} ) {
+                    $cmd="cd $cachemod && git checkout $key->{ref}";
+                    shell($cmd);
+                }
+
+                $v = get_version($cachemod);
+                #$r = get_version($cachemod,"remotes/origin/master");
+                my $msg="Updated $envmod $v";
+                $msg="Changed $envmod from $oldv to $v" if defined $oldv and $v ne $oldv;
+                $msg.=" to $moddir/$mod" if $CFG{VERBOSE};
+                if (lc($G{'ACTION'}) eq "fetch") {
+                    $msg="Fetched $envmod $v";
+                    #$msg.=" ($r) in $cachemod" if $CFG{VERBOSE};
+                    $msg.=" to $cachemod" if $CFG{VERBOSE};
+                }
+                msg $msg;
+            }
+            ### rsync
+            if ( -d $cachemod) {
+                if ( (lc($G{'ACTION'}) eq "update") ) {
+                    my $dst=File::Spec->rel2abs("$moddir");
+                    msg("Installed $envmod $v") if ! -d "$moddir/$mod";
+                    logmsg("Installed $envmod $v") if ! -d "$moddir/$mod";
+                    $cmd= $CFG{RSYNC}." $cachemod/ $moddir/$mod ";
+                    error("Failed $cmd") if ( shell($cmd) ne 0 );
+                    logmsg("Changed $envmod from $oldv to $v") if defined $oldv and $v ne $oldv;
+                }
+            }
+        }
+
+    }
+
+    if ( lc($G{'ACTION'}) eq "clean" ) {
+        my $v;
+        foreach my $fn (glob("$moddir/*")) {
+            my $mod=basename($fn);
+            if ( -d "$fn" ) {
+                $v = get_version("$cache/$mod");
+                delete_mod($mod,$moddir);
+                msg "Removed $env/$mod $v" if ! $CFG{VERBOSE};
+                msg "Removed $env/$mod $v from $moddir/$mod" if $CFG{VERBOSE};
+                logmsg "Removed $env/$mod $v";
+            }
+        }
+        foreach my $fn (glob("$cache/*")) {
+            my $mod=basename($fn);
+            delete_mod($mod,$cache) if defined $mod and $mod ne "";
+        }
+    }
+    ### autoclean mods deleted from Puppetfile.yaml
+    if ( $CFG{'AUTOCLEAN'} ) {
+        if ( (lc($G{'ACTION'}) eq "update") or (lc($G{'ACTION'}) eq "fetch") ) {
+            foreach my $fn (glob("$moddir/*")) {
+                my $mod=basename($fn);
+                my $found=0;
+                if ( -d "$fn" ) {
+                    foreach my $key (@{$data->{MODULES}}) {
+                        $found++ if ( $key->{'mod'} eq $mod );
+                    }
+                    debug("Removing $mod") if ! $found;
+                    if ( ! $found ) {
+                        delete_mod($mod,$moddir);
+                        msg "Removed $env/$mod";
+                        logmsg "Removed $env/$mod";
+                        my $cachemod=$cache."/".$mod;
+                        delete_mod($mod,$cache);
+                        msg "Removed $cachemod" if $CFG{VERBOSE};
+                    }
+                }
+            }
+        }
+    }
+}
+
+#
+# Main
+#
+
+load_config();
+
+GetOptions(
+    "debug" => \$CFG{DEBUG},
+    "environment=s" => \$G{ENVIRONMENT},
+    "moduledir" => \$CFG{MODULEDIR},
+    "repofile" => \$CFG{REPOLIST},
+    "help" => sub {pod2usage(-verbose => 1)},
+    "man" => sub {pod2usage(-verbose => 2)},
+    "test" => \$CFG{TEST},
+    "verbose"  => \$CFG{VERBOSE},
+    "quiet"  => \$CFG{QUIET},
+    ) || pod2usage();
+
+$G{'ACTION'} = $ARGV[0];
+pod2usage(-verbose => 1) if ! defined $G{'ACTION'};
+
+error("$CFG{MODULEDIR} is not a directory") if ! -d $CFG{MODULEDIR};
+
+convert_puppetfile($ARGV[1]) if $G{ACTION} eq "convert";
+
+my $cmd="find $CFG{MODULEDIR} -type f -name '$CFG{REPOLIST}' 2> /dev/null"; debug($cmd);
+my @puppetfiles = `$cmd`;
+
+debug "\@puppetfiles = ".Dumper(\@puppetfiles);
+
+my $found=0;
+for my $pfile (sort @puppetfiles) {
+    chomp($pfile);
+    parse_env($pfile);
+    $found++;
+}
+
+msg "WARNING: No $CFG{REPOLIST} found in $CFG{MODULEDIR}. For more info, run $0 --man" if $found eq 0;
