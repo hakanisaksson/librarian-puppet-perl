@@ -72,12 +72,12 @@ Puppetfile.yaml format example:
 
 **Example librarian-puppet-perl.yaml**:
 
-   ---
-   AUTOCLEAN: 1
-   DEBUG: 0
-   LOGDIR: /var/log/puppet
-   MODULEDIR: /etc/puppet/environments
-   REPOLIST: Puppetfile.yaml
-   RSYNC: rsync -a --delete --exclude .git
-   TEST: 0
-   TMPDIR: /etc/puppet/environments/.librarian-puppet-perl
+    ---
+    AUTOCLEAN: 1
+    DEBUG: 0
+    LOGDIR: /var/log/puppet
+    MODULEDIR: /etc/puppet/environments
+    REPOLIST: Puppetfile.yaml
+    RSYNC: rsync -a --delete --exclude .git
+    TEST: 0
+    TMPDIR: /etc/puppet/environments/.librarian-puppet-perl
