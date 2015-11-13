@@ -64,7 +64,9 @@ Puppetfile.yaml format example:
 
 **Installation**
     Ensure that perl-YAML is installed
+
     Create Puppetfile.yaml
+
     Run librarian-puppet-perl update
 
 **Configuration**
