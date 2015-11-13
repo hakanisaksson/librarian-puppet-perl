@@ -71,6 +71,7 @@ Puppetfile.yaml format example:
    librarian-puppet-perl creates a file librarian-puppet-perl.yaml in the directory where it is runnig if it does not exist. Edit the file to change defaults. Defaults can be overridden on the commandline.
 
 **Example librarian-puppet-perl.yaml**:
+
    ---
    AUTOCLEAN: 1
    DEBUG: 0
