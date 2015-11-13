@@ -63,11 +63,9 @@ Puppetfile.yaml format example:
     - mod: ntp
 
 **Installation**
-    Ensure that perl-YAML is installed
-
-    Create Puppetfile.yaml
-
-    Run librarian-puppet-perl update
+   - Ensure that perl-YAML is installed
+   - Create Puppetfile.yaml
+   - Run librarian-puppet-perl update
 
 **Configuration**
    librarian-puppet-perl creates a file librarian-puppet-perl.yaml in the directory where it is runnig if it does not exist. Edit the file to change defaults. Defaults can be overridden on the commandline.
